@@ -1,3 +1,5 @@
+fastapi
+uvicorn[standard]
 deap
 matplotlib
 azure-storage-blob
