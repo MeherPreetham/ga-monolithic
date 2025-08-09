@@ -8,7 +8,7 @@ import random
 import copy
 import asyncio
 
-from typing import Dict
+from typing import Dict, Optional, List
 from statistics import mean, pstdev
 
 import matplotlib.pyplot as plt
@@ -19,7 +19,7 @@ from azure.storage.blob import BlobServiceClient
 
 app = FastAPI()
 
-# In‐memory stores for simplicity
+# In-memory stores for simplicity
 job_states: Dict[str, Dict] = {}
 job_results: Dict[str, Dict] = {}
 
@@ -35,16 +35,18 @@ class RunRequest(BaseModel):
     idle_energy: float    = Field(default=float(os.getenv("IDLE_ENERGY", 0.002)), ge=0)
     stagnation_limit: int = Field(default=int(os.getenv("STAGNATION_LIMIT", 20)), gt=0)
     seed: int             = Field(default=int(os.getenv("SEED", 42)))
+    case_label: Optional[str] = Field(default=None, description="Optional label for grouping/analysis")
 
-# === DEAP setup helpers ===
+############# DEAP setup ##############
 def setup_deap():
     try:
         creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
         creator.create("Individual", list, fitness=creator.FitnessMin)
     except RuntimeError:
+        # If already created in this process
         pass
 
-def make_toolbox(req: RunRequest, exec_times):
+def make_toolbox(req: RunRequest, exec_times: List[int]):
     toolbox = base.Toolbox()
     toolbox.register("attr_core", random.randint, 0, req.num_cores - 1)
     toolbox.register("individual",
@@ -81,6 +83,7 @@ def make_toolbox(req: RunRequest, exec_times):
 
         score = W_MAKESPAN * nm + W_ENERGY * ne + W_IMBALANCE * ni
 
+        # Attach raw metrics to the individual
         individual.core_times    = core_times
         individual.total_energy  = total_e
         individual.makespan      = makespan
@@ -96,6 +99,20 @@ def make_toolbox(req: RunRequest, exec_times):
     toolbox.register("clone",   copy.deepcopy)
     return toolbox
 
+def compute_metrics_for_individual(individual: List[int], exec_times: List[int],
+                                   num_cores: int, base_energy: float, idle_energy: float):
+    """Compute raw makespan/energy/imbalance/core_times independent of DEAP attrs."""
+    core_times = [0.0] * num_cores
+    for idx, c in enumerate(individual):
+        core_times[c] += exec_times[idx]
+    makespan = max(core_times)
+    active_e = sum(ct * base_energy for ct in core_times)
+    idle_e   = sum((makespan - ct) * idle_energy for ct in core_times)
+    total_e  = active_e + idle_e
+    mean_load = (sum(exec_times) / max(num_cores, 1)) if num_cores > 0 else 1e-9
+    imbalance = pstdev(core_times) / (mean_load if mean_load != 0 else 1e-9)
+    return core_times, makespan, total_e, imbalance
+
 ########## API Endpoints ##############
 
 @app.post("/run")
@@ -105,7 +122,8 @@ async def run(req: RunRequest):
         "status": "running",
         "generation": 0,
         "best_fitness": None,
-        "best_individual": None
+        "best_individual": None,
+        "case_label": req.case_label
     }
     # launch background GA task
     asyncio.create_task(_run_ga(job_id, req))
@@ -138,7 +156,7 @@ async def _run_ga(job_id: str, req: RunRequest):
         job_states[job_id]["error"]  = "Missing AZURE_STORAGE_CONNECTION_STRING or BLOB_CONTAINER"
         return
 
-    # Generate execution times
+    # Generate execution times (seeded)
     rng_exec = random.Random(req.seed)
     exec_times = [rng_exec.randint(10, 20) for _ in range(req.num_tasks)]
 
@@ -152,29 +170,43 @@ async def _run_ga(job_id: str, req: RunRequest):
         ind.fitness.values = toolbox.evaluate(ind)
     hall = tools.HallOfFame(1)
 
-    best_per_gen, avg_per_gen, std_per_gen = [], [], []
+    best_per_gen: List[float] = []
+    avg_per_gen:  List[float] = []
+    std_per_gen:  List[float] = []
+
     stagnation = 0
     best_so_far = min(ind.fitness.values[0] for ind in pop)
 
     start_time = time.time()
+    gen_executed = 0
+
     for gen in range(1, req.num_generations + 1):
+        # Update hall and compute current population metrics
         hall.update(pop)
         curr_best = hall[0].fitness.values[0]
 
+        # Per-generation population fitness stats (for alignment with executed gens)
+        fits = [ind.fitness.values[0] for ind in pop]
+        best_per_gen.append(min(fits))
+        avg_per_gen.append(mean(fits))
+        std_per_gen.append(pstdev(fits))
+        gen_executed = gen  # count only after we recorded metrics
+
+        # Update best/stagnation
         if curr_best < best_so_far:
             best_so_far = curr_best
             stagnation = 0
         else:
             stagnation += 1
 
-        # Record intermediate state
+        # Record intermediate state (current best from hall)
         job_states[job_id].update({
-            "generation":     gen,
-            "best_fitness":   curr_best,
-            "best_individual": list(hall[0])
+            "generation":      gen,
+            "best_fitness":    curr_best,
+            "best_individual": list(hall[0]),
         })
 
-        # Early stop
+        # Early stop AFTER recording metrics for this generation
         if stagnation >= req.stagnation_limit:
             break
 
@@ -194,29 +226,53 @@ async def _run_ga(job_id: str, req: RunRequest):
         offspring[0] = hall[0]
         pop[:] = offspring
 
-        fits = [ind.fitness.values[0] for ind in pop]
-        best_per_gen.append(min(fits))
-        avg_per_gen.append(mean(fits))
-        std_per_gen.append(pstdev(fits))
+    # Final metrics for best individual
+    best_individual = list(hall[0])
+    core_times, makespan, total_energy, imbalance = compute_metrics_for_individual(
+        best_individual, exec_times, req.num_cores, req.base_energy, req.idle_energy
+    )
 
-    # Build final result
     elapsed = time.time() - start_time
+
+    # Build final result JSON
     final = {
+        # Identity
         "run_id":               job_id,
-        "generations_executed": gen,
+        "case_label":           job_states[job_id].get("case_label"),
+
+        # Config snapshot
+        "num_tasks":            req.num_tasks,
+        "num_cores":            req.num_cores,
+        "num_population":       req.num_population,
+        "num_generations":      req.num_generations,
+        "crossover_rate":       req.crossover_rate,
+        "mutation_rate":        req.mutation_rate,
+        "base_energy":          req.base_energy,
+        "idle_energy":          req.idle_energy,
+        "stagnation_limit":     req.stagnation_limit,
+        "seed":                 req.seed,
+
+        # Outcomes
+        "generations_executed": len(best_per_gen),
         "elapsed_time_s":       elapsed,
-        "best_individual":      list(hall[0]),
+        "best_individual":      best_individual,
         "best_fitness":         hall[0].fitness.values[0],
         "best_per_generation":  best_per_gen,
         "avg_per_generation":   avg_per_gen,
-        "std_per_generation":   std_per_gen
+        "std_per_generation":   std_per_gen,
+
+        # Raw metrics for the final best solution
+        "makespan":             makespan,
+        "total_energy":         total_energy,
+        "imbalance":            imbalance,
+        "core_times":           core_times
     }
 
     # Upload JSON
     svc = BlobServiceClient.from_connection_string(conn_str)
     try:
         svc.create_container(container)
-    except:
+    except Exception:
         pass
     txt_blob = svc.get_blob_client(container=container, blob=f"{job_id}.txt")
     txt_blob.upload_blob(json.dumps(final), overwrite=True)
@@ -232,10 +288,11 @@ async def _run_ga(job_id: str, req: RunRequest):
 
     buf = io.BytesIO()
     plt.savefig(buf, format="png", dpi=150)
+    plt.close()  # free figure
     buf.seek(0)
     png_blob = svc.get_blob_client(container=container, blob=f"{job_id}.png")
     png_blob.upload_blob(buf.read(), overwrite=True)
 
-    # Mark done
+    # Mark done and store result in memory
     job_states[job_id]["status"] = "done"
     job_results[job_id] = final
