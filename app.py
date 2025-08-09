@@ -7,6 +7,7 @@ import time
 import random
 import copy
 import asyncio
+import logging
 
 from typing import Dict, Optional, List
 from statistics import mean, pstdev
@@ -16,6 +17,13 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from deap import base, creator, tools
 from azure.storage.blob import BlobServiceClient
+
+############ Logging ###################
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger("ga-monolithic-api")
 
 app = FastAPI()
 
@@ -115,6 +123,10 @@ def compute_metrics_for_individual(individual: List[int], exec_times: List[int],
 
 ########## API Endpoints ##############
 
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
 @app.post("/run")
 async def run(req: RunRequest):
     job_id = str(uuid.uuid4())
@@ -156,6 +168,16 @@ async def _run_ga(job_id: str, req: RunRequest):
         job_states[job_id]["error"]  = "Missing AZURE_STORAGE_CONNECTION_STRING or BLOB_CONTAINER"
         return
 
+    # Log params snapshot
+    logger.info(
+        f"[{job_id}] GA params: tasks={req.num_tasks}, cores={req.num_cores}, "
+        f"pop={req.num_population}, gens={req.num_generations}, "
+        f"cx={req.crossover_rate}, mut={req.mutation_rate}, "
+        f"baseE={req.base_energy}, idleE={req.idle_energy}, "
+        f"stagnation={req.stagnation_limit}, seed={req.seed}, "
+        f"case_label={req.case_label}"
+    )
+
     # Generate execution times (seeded)
     rng_exec = random.Random(req.seed)
     exec_times = [rng_exec.randint(10, 20) for _ in range(req.num_tasks)]
@@ -178,19 +200,17 @@ async def _run_ga(job_id: str, req: RunRequest):
     best_so_far = min(ind.fitness.values[0] for ind in pop)
 
     start_time = time.time()
-    gen_executed = 0
 
     for gen in range(1, req.num_generations + 1):
         # Update hall and compute current population metrics
         hall.update(pop)
         curr_best = hall[0].fitness.values[0]
 
-        # Per-generation population fitness stats (for alignment with executed gens)
+        # Per-generation population fitness stats
         fits = [ind.fitness.values[0] for ind in pop]
         best_per_gen.append(min(fits))
         avg_per_gen.append(mean(fits))
         std_per_gen.append(pstdev(fits))
-        gen_executed = gen  # count only after we recorded metrics
 
         # Update best/stagnation
         if curr_best < best_so_far:
@@ -208,6 +228,7 @@ async def _run_ga(job_id: str, req: RunRequest):
 
         # Early stop AFTER recording metrics for this generation
         if stagnation >= req.stagnation_limit:
+            logger.info(f"[{job_id}] Early stop at gen={gen} (stagnation={stagnation}).")
             break
 
         # Produce next generation
@@ -296,3 +317,4 @@ async def _run_ga(job_id: str, req: RunRequest):
     # Mark done and store result in memory
     job_states[job_id]["status"] = "done"
     job_results[job_id] = final
+    logger.info(f"[{job_id}] Completed. gens_exec={len(best_per_gen)} best_fitness={final['best_fitness']:.6f}")
