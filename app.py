@@ -1,320 +1,452 @@
-#!/usr/bin/env python3
+# ga-controller/app.py
 import os
 import uuid
-import json
-import io
 import time
-import random
-import copy
-import asyncio
+import json
 import logging
+import asyncio
+import socket
+import random
+import io
 
-from typing import Dict, Optional, List
-from statistics import mean, pstdev
-
-import matplotlib.pyplot as plt
+from typing import List, Optional, Dict
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from deap import base, creator, tools
+import httpx
+import redis
+import matplotlib.pyplot as plt
+from statistics import mean, pstdev
 from azure.storage.blob import BlobServiceClient
 
-############ Logging ###################
+########## LOGGING #############################################
 logging.basicConfig(
-    level=os.getenv("LOG_LEVEL", "INFO"),
+    level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 )
-logger = logging.getLogger("ga-monolithic-api")
+logger = logging.getLogger("ga-controller")
 
-app = FastAPI()
+########## POD & DISCOVERY #####################################
+POD = os.getenv("POD_NAME", "unknown")
+CONTROLLER_HEADLESS = os.getenv("CONTROLLER_HEADLESS", "ga-controller-headless.default.svc.cluster.local")
+CONTROLLER_PORT     = int(os.getenv("CONTROLLER_PORT", "8000"))
 
-# In-memory stores for simplicity
-job_states: Dict[str, Dict] = {}
-job_results: Dict[str, Dict] = {}
+########## REDIS ###############################################
+rdb = redis.Redis(
+    host=os.getenv("REDIS_HOST", "redis"),
+    port=int(os.getenv("REDIS_PORT", 6379)),
+    db=int(os.getenv("REDIS_DB",   0)),
+    password=os.getenv("REDIS_PASSWORD"),
+    decode_responses=True
+)
 
-############# Request model #############
-class RunRequest(BaseModel):
-    num_tasks: int        = Field(default=int(os.getenv("NUM_TASKS", 1000)), gt=0)
-    num_cores: int        = Field(default=int(os.getenv("NUM_CORES", 16)), gt=1)
-    num_population: int   = Field(default=int(os.getenv("NUM_POPULATION", 100)), gt=1)
-    num_generations: int  = Field(default=int(os.getenv("NUM_GENERATIONS", 500)), gt=1)
-    crossover_rate: float = Field(default=float(os.getenv("CROSSOVER_RATE", 0.8)), ge=0, le=1)
-    mutation_rate: float  = Field(default=float(os.getenv("MUTATION_RATE", 0.2)), ge=0, le=1)
-    base_energy: float    = Field(default=float(os.getenv("BASE_ENERGY", 0.01)), ge=0)
-    idle_energy: float    = Field(default=float(os.getenv("IDLE_ENERGY", 0.002)), ge=0)
-    stagnation_limit: int = Field(default=int(os.getenv("STAGNATION_LIMIT", 20)), gt=0)
-    seed: int             = Field(default=int(os.getenv("SEED", 42)))
-    case_label: Optional[str] = Field(default=None, description="Optional label for grouping/analysis")
+########## AZURE BLOB (created lazily) #########################
+AZ_CONN_STR   = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+AZ_CONTAINER  = os.getenv("BLOB_CONTAINER")
 
-############# DEAP setup ##############
-def setup_deap():
-    try:
-        creator.create("FitnessMin", base.Fitness, weights=(-1.0,))
-        creator.create("Individual", list, fitness=creator.FitnessMin)
-    except RuntimeError:
-        # If already created in this process
-        pass
+########## EVALUATOR ###########################################
+EVALUATOR_HOST = os.getenv("EVALUATOR_HOST", "ga-evaluator")
+EVALUATOR_PORT = os.getenv("EVALUATOR_PORT", "5000")
+EVALUATOR_URL  = f"http://{EVALUATOR_HOST}:{EVALUATOR_PORT}/evaluate"
 
-def make_toolbox(req: RunRequest, exec_times: List[int]):
-    toolbox = base.Toolbox()
-    toolbox.register("attr_core", random.randint, 0, req.num_cores - 1)
-    toolbox.register("individual",
-                     tools.initRepeat,
-                     creator.Individual,
-                     toolbox.attr_core,
-                     n=req.num_tasks)
-    toolbox.register("population",
-                     tools.initRepeat,
-                     list,
-                     toolbox.individual,
-                     n=req.num_population)
+########## FASTAPI #############################################
+app = FastAPI(title="GA Controller (islands)")
 
-    TOTAL_EXEC   = sum(exec_times)
-    MEAN_LOAD    = TOTAL_EXEC / req.num_cores if req.num_cores > 0 else 1e-9
-    MAX_MAKESPAN = TOTAL_EXEC
-    MAX_ENERGY   = TOTAL_EXEC * req.base_energy \
-                   + (req.num_cores - 1) * TOTAL_EXEC * req.idle_energy
-    W_MAKESPAN, W_ENERGY, W_IMBALANCE = 0.4, 0.2, 0.4
-
-    def evaluate(individual):
-        core_times = [0.0] * req.num_cores
-        for idx, c in enumerate(individual):
-            core_times[c] += exec_times[idx]
-        makespan = max(core_times)
-        active_e = sum(ct * req.base_energy for ct in core_times)
-        idle_e   = sum((makespan - ct) * req.idle_energy for ct in core_times)
-        total_e  = active_e + idle_e
-        imbalance = pstdev(core_times) / MEAN_LOAD if TOTAL_EXEC > 0 else 0.0
-
-        nm = min(makespan / MAX_MAKESPAN, 1.0)
-        ne = min(total_e / MAX_ENERGY,   1.0)
-        ni = min(imbalance,              1.0)
-
-        score = W_MAKESPAN * nm + W_ENERGY * ne + W_IMBALANCE * ni
-
-        # Attach raw metrics to the individual
-        individual.core_times    = core_times
-        individual.total_energy  = total_e
-        individual.makespan      = makespan
-        individual.imbalance     = imbalance
-        individual.fitness_value = score
-        return (score,)
-
-    toolbox.register("evaluate", evaluate)
-    toolbox.register("mate",    tools.cxUniform,   indpb=req.crossover_rate)
-    toolbox.register("mutate",  tools.mutUniformInt,
-                     low=0, up=req.num_cores - 1, indpb=req.mutation_rate)
-    toolbox.register("select",  tools.selTournament, tournsize=3)
-    toolbox.register("clone",   copy.deepcopy)
-    return toolbox
-
-def compute_metrics_for_individual(individual: List[int], exec_times: List[int],
-                                   num_cores: int, base_energy: float, idle_energy: float):
-    """Compute raw makespan/energy/imbalance/core_times independent of DEAP attrs."""
-    core_times = [0.0] * num_cores
-    for idx, c in enumerate(individual):
-        core_times[c] += exec_times[idx]
-    makespan = max(core_times)
-    active_e = sum(ct * base_energy for ct in core_times)
-    idle_e   = sum((makespan - ct) * idle_energy for ct in core_times)
-    total_e  = active_e + idle_e
-    mean_load = (sum(exec_times) / max(num_cores, 1)) if num_cores > 0 else 1e-9
-    imbalance = pstdev(core_times) / (mean_load if mean_load != 0 else 1e-9)
-    return core_times, makespan, total_e, imbalance
-
-########## API Endpoints ##############
-
+########## HEALTH ##############################################
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 
-@app.post("/run")
-async def run(req: RunRequest):
-    job_id = str(uuid.uuid4())
-    job_states[job_id] = {
-        "status": "running",
-        "generation": 0,
-        "best_fitness": None,
-        "best_individual": None,
-        "case_label": req.case_label
-    }
-    # launch background GA task
-    asyncio.create_task(_run_ga(job_id, req))
-    return {"job_id": job_id}
+########## MODELS ##############################################
+class RunRequest(BaseModel):
+    # GA config (keep existing names for controller, add optional case_label)
+    num_tasks:          int   = Field(..., gt=0)
+    num_cores:          int   = Field(..., gt=0)
+    population:         int   = Field(..., gt=1)
+    generations:        int   = Field(..., gt=0)
+    crossover_rate:     float = Field(..., ge=0, le=1)
+    mutation_rate:      float = Field(..., ge=0, le=1)
+    migration_interval: int   = Field(..., gt=0)
+    num_islands:        int   = Field(..., gt=0)
+    base_energy:        float = Field(..., gt=0)
+    idle_energy:        float = Field(..., ge=0)
+    seed:               Optional[int] = None
+    stagnation_limit:   Optional[int] = Field(None, gt=1)
+    case_label:         Optional[str] = None
 
-@app.get("/status/{job_id}")
-async def status(job_id: str):
-    state = job_states.get(job_id)
-    if not state:
-        raise HTTPException(404, "Job not found")
-    return state
+class RunResponse(BaseModel):
+    job_id: str
 
-@app.get("/result/{job_id}")
-async def result(job_id: str):
-    if job_states.get(job_id, {}).get("status") == "running":
-        raise HTTPException(400, "Job still running")
-    res = job_results.get(job_id)
-    if not res:
-        raise HTTPException(404, "Job not found or failed")
-    return res
+class ExecuteRequest(RunRequest):
+    job_id: str = Field(..., description="Job to execute on this island")
 
-######## Internal GA runner ################
+########## EVALUATOR HELPER ####################################
+async def eval_with_retries(
+    client: httpx.AsyncClient,
+    payload: dict,
+    retries: int = 3,
+    backoff: float = 0.5
+) -> float:
+    for attempt in range(1, retries + 1):
+        try:
+            resp = await client.post(EVALUATOR_URL, json=payload, timeout=20.0)
+            resp.raise_for_status()
+            data = resp.json()
+            return float(data["fitness"])
+        except Exception as e:
+            if attempt == retries:
+                logger.error(f"Evaluator call failed after {retries} tries: {e}")
+                raise
+            await asyncio.sleep(backoff * attempt)
 
-async def _run_ga(job_id: str, req: RunRequest):
-    # Prepare Azure Blob client
-    conn_str  = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
-    container = os.getenv("BLOB_CONTAINER")
-    if not conn_str or not container:
-        job_states[job_id]["status"] = "error"
-        job_states[job_id]["error"]  = "Missing AZURE_STORAGE_CONNECTION_STRING or BLOB_CONTAINER"
+########## ISLAND FAN-OUT ######################################
+async def fan_out(job_id: str, cfg: Dict):
+    try:
+        infos = socket.getaddrinfo(CONTROLLER_HEADLESS, CONTROLLER_PORT, proto=socket.IPPROTO_TCP)
+        hosts = sorted({f"{addr[4][0]}:{CONTROLLER_PORT}" for addr in infos})
+    except Exception as e:
+        logger.warning(f"Headless discovery failed; running locally only. {e}")
+        hosts = []
+
+    if not hosts:
         return
 
-    # Log params snapshot
-    logger.info(
-        f"[{job_id}] GA params: tasks={req.num_tasks}, cores={req.num_cores}, "
-        f"pop={req.num_population}, gens={req.num_generations}, "
-        f"cx={req.crossover_rate}, mut={req.mutation_rate}, "
-        f"baseE={req.base_energy}, idleE={req.idle_energy}, "
-        f"stagnation={req.stagnation_limit}, seed={req.seed}, "
-        f"case_label={req.case_label}"
-    )
+    logger.info(f"Dispatching Job {job_id} to islands: {hosts}")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        tasks = [
+            client.post(f"http://{host}/execute", json={"job_id": job_id, **cfg})
+            for host in hosts
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for host, res in zip(hosts, results):
+            if isinstance(res, Exception):
+                logger.error(f"Island {host} fan-out FAILED: {res}")
+            else:
+                logger.info(f"Island {host} fan-out OK: {res.status_code}")
 
-    # Generate execution times (seeded)
-    rng_exec = random.Random(req.seed)
-    exec_times = [rng_exec.randint(10, 20) for _ in range(req.num_tasks)]
+########## SIMPLE GA UTILS #####################################
+def init_population(pop_size: int, num_tasks: int, num_cores: int, rng: random.Random) -> List[List[int]]:
+    return [[rng.randint(0, num_cores - 1) for _ in range(num_tasks)] for _ in range(pop_size)]
 
-    # Setup GA
-    setup_deap()
-    toolbox = make_toolbox(req, exec_times)
+def next_generation(population: List[List[int]], fitnesses: List[float], cfg: Dict) -> List[List[int]]:
+    pop_size = len(population)
+    tour_size = 3
 
-    # Initialize
-    pop = toolbox.population()
-    for ind in pop:
-        ind.fitness.values = toolbox.evaluate(ind)
-    hall = tools.HallOfFame(1)
+    # Tournament selection
+    selected = []
+    for _ in range(pop_size):
+        aspirants = random.sample(list(zip(population, fitnesses)), tour_size)
+        winner    = min(aspirants, key=lambda x: x[1])[0]
+        selected.append(winner.copy())
 
+    # One-point crossover
+    offspring = []
+    for i in range(0, pop_size, 2):
+        p1, p2 = selected[i], selected[(i+1) % pop_size]
+        if random.random() < cfg['crossover_rate']:
+            pt = random.randint(1, len(p1) - 1)
+            offspring += [p1[:pt] + p2[pt:], p2[:pt] + p1[pt:]]
+        else:
+            offspring += [p1.copy(), p2.copy()]
+
+    # Mutation (single gene)
+    for ind in offspring:
+        if random.random() < cfg['mutation_rate']:
+            idx = random.randrange(len(ind))
+            ind[idx] = random.randint(0, cfg['num_cores'] - 1)
+
+    return offspring[:pop_size]
+
+def compute_core_times(individual: List[int], exec_times: List[float], num_cores: int) -> List[float]:
+    cores = [0.0] * num_cores
+    for i, c in enumerate(individual):
+        cores[c] += exec_times[i]
+    return cores
+
+def compute_raw_metrics(individual: List[int], exec_times: List[float], num_cores: int,
+                        base_energy: float, idle_energy: float):
+    cores = compute_core_times(individual, exec_times, num_cores)
+    makespan = max(cores) if cores else 0.0
+    active_e = sum(ct * base_energy for ct in cores)
+    idle_e   = sum((makespan - ct) * idle_energy for ct in cores)
+    total_e  = active_e + idle_e
+    mean_load = (sum(exec_times) / max(num_cores, 1)) if num_cores > 0 else 1e-9
+    imbalance = pstdev(cores) / (mean_load if mean_load != 0 else 1e-9)
+    return cores, makespan, total_e, imbalance
+
+########## API: START RUN ######################################
+@app.post("/run", response_model=RunResponse)
+async def start_run(req: RunRequest):
+    if not AZ_CONN_STR or not AZ_CONTAINER:
+        raise HTTPException(status_code=500, detail="Missing AZURE_STORAGE_CONNECTION_STRING or BLOB_CONTAINER")
+
+    job_id = str(uuid.uuid4())
+    redis_key = f"job:{job_id}"
+
+    # initialize basic status in Redis
+    rdb.hset(redis_key, mapping={
+        "status": "running",
+        "generation": "0",
+        "best": "",
+        "individual": ""
+    })
+
+    cfg = req.dict()
+    # 1) run GA on this pod
+    asyncio.create_task(run_ga(job_id, cfg))
+    # 2) fan-out to islands
+    asyncio.create_task(fan_out(job_id, cfg))
+
+    return RunResponse(job_id=job_id)
+
+########## BACK-COMPAT (island entry) ##########################
+@app.post("/execute")
+async def execute_island(req: ExecuteRequest):
+    await run_ga(req.job_id, req.dict(exclude={"job_id"}))
+    return {"status": "accepted", "pod": POD}
+
+########## API: STATUS (monolithic-style) ######################
+@app.get("/status/{job_id}")
+def status(job_id: str):
+    key = f"job:{job_id}"
+    if not rdb.exists(key):
+        raise HTTPException(404, "Job not found")
+    data = rdb.hgetall(key)
+    return {
+        "status":        data.get("status"),
+        "generation":    int(data.get("generation", 0)),
+        "best_fitness":  float(data["best"]) if data.get("best") else None,
+        "best_individual": json.loads(data.get("individual", "[]")) if data.get("individual") else None
+    }
+
+# keep old paths working
+@app.get("/run/{job_id}/status")
+def status_compat(job_id: str):
+    return status(job_id)
+
+########## API: RESULT (monolithic-style) ######################
+@app.get("/result/{job_id}")
+def result(job_id: str):
+    key = f"job:{job_id}"
+    if not rdb.exists(key):
+        raise HTTPException(404, "Job not found")
+
+    if rdb.hget(key, "status") == "running":
+        raise HTTPException(400, "Job still running")
+
+    # Load final JSON from blob (single source of truth)
+    try:
+        svc  = BlobServiceClient.from_connection_string(AZ_CONN_STR)
+        blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.txt")
+        payload = json.loads(blob.download_blob().readall())
+        return payload
+    except Exception as e:
+        logger.error(f"Failed to read final result from blob: {e}")
+        raise HTTPException(500, "Failed to read final result from blob")
+
+# keep old path working
+@app.get("/run/{job_id}/result")
+def result_compat(job_id: str):
+    return result(job_id)
+
+########## MAIN GA LOOP (island) ###############################
+MIGRATION_KEY = "ga:migrants"
+
+async def run_ga(job_id: str, cfg: Dict):
+    key = f"job:{job_id}"
+    stagnated = False
+
+    # Azure blob client (lazy)
+    svc = BlobServiceClient.from_connection_string(AZ_CONN_STR)
+    try:
+        svc.create_container(AZ_CONTAINER)
+    except Exception:
+        pass
+
+    # Prepare execution times (seeded)
+    base_seed = int(cfg.get("seed") or 0)
+    rng_exec  = random.Random(base_seed)
+    exec_times = [rng_exec.randint(10, 20) for _ in range(cfg["num_tasks"])]
+    logger.info(f"Job {job_id}: exec_times head={exec_times[:5]}")
+
+    # Island RNG (so each island differs deterministically)
+    pod_name  = os.getenv("POD_NAME", "ga-island-0")
+    island_id = int(pod_name.rsplit("-", 1)[-1]) if "-" in pod_name and pod_name.rsplit("-", 1)[-1].isdigit() else 0
+    rng_pop   = random.Random(base_seed + island_id)
+
+    # Initialize population
+    population = init_population(cfg["population"], cfg["num_tasks"], cfg["num_cores"], rng_pop)
+
+    # Per-generation stats
     best_per_gen: List[float] = []
     avg_per_gen:  List[float] = []
     std_per_gen:  List[float] = []
 
-    stagnation = 0
-    best_so_far = min(ind.fitness.values[0] for ind in pop)
+    prev_best: float = float('inf')
+    best_individual: Optional[List[int]] = None
+    no_improve = 0
+    stagnation_lim = int(cfg.get("stagnation_limit") or 0)
+    interval = cfg["migration_interval"]
+    num_islands = cfg["num_islands"]
 
-    start_time = time.time()
+    start_all = time.time()
+    gen_executed = 0
 
-    for gen in range(1, req.num_generations + 1):
-        # Update hall and compute current population metrics
-        hall.update(pop)
-        curr_best = hall[0].fitness.values[0]
+    for gen in range(1, cfg["generations"] + 1):
+        # Evaluate population in parallel via evaluator service
+        async with httpx.AsyncClient() as client:
+            tasks = [
+                eval_with_retries(client, {
+                    "individual":      indiv,
+                    "execution_times": exec_times,
+                    "base_energy":     cfg["base_energy"],
+                    "idle_energy":     cfg["idle_energy"],
+                })
+                for indiv in population
+            ]
+            fitnesses = await asyncio.gather(*tasks)
 
-        # Per-generation population fitness stats
-        fits = [ind.fitness.values[0] for ind in pop]
-        best_per_gen.append(min(fits))
-        avg_per_gen.append(mean(fits))
-        std_per_gen.append(pstdev(fits))
+        # Per-gen stats
+        best = min(fitnesses)
+        avgv = mean(fitnesses)
+        stdv = pstdev(fitnesses) if len(fitnesses) > 1 else 0.0
 
-        # Update best/stagnation
-        if curr_best < best_so_far:
-            best_so_far = curr_best
-            stagnation = 0
-        else:
-            stagnation += 1
+        best_per_gen.append(best)
+        avg_per_gen.append(avgv)
+        std_per_gen.append(stdv)
+        gen_executed = gen
 
-        # Record intermediate state (current best from hall)
-        job_states[job_id].update({
-            "generation":      gen,
-            "best_fitness":    curr_best,
-            "best_individual": list(hall[0]),
+        # Update Redis progress with *current* best (even if not global-best)
+        rdb.hset(key, mapping={
+            "generation": str(gen),
+            "best":       str(best if prev_best == float('inf') else min(prev_best, best)),
+            "individual": json.dumps(best_individual or [])
         })
 
-        # Early stop AFTER recording metrics for this generation
-        if stagnation >= req.stagnation_limit:
-            logger.info(f"[{job_id}] Early stop at gen={gen} (stagnation={stagnation}).")
-            break
+        # Update global best + stagnation
+        if best < prev_best:
+            idx             = fitnesses.index(best)
+            best_individual = population[idx]
+            prev_best       = best
+            no_improve      = 0
+            rdb.hset(key, mapping={
+                "best":       str(prev_best),
+                "individual": json.dumps(best_individual)
+            })
+            # publish migrant
+            rdb.lpush(MIGRATION_KEY, json.dumps(best_individual))
+            rdb.ltrim(MIGRATION_KEY, 0, num_islands - 1)
+        else:
+            if stagnation_lim > 0:
+                no_improve += 1
+                if no_improve >= stagnation_lim:
+                    stagnated = True
+                    logger.info(f"Job {job_id}: stagnated at gen={gen}")
+                    break
 
-        # Produce next generation
-        offspring = list(map(toolbox.clone, toolbox.select(pop, len(pop))))
-        for c1, c2 in zip(offspring[::2], offspring[1::2]):
-            if random.random() < req.crossover_rate:
-                toolbox.mate(c1, c2)
-                del c1.fitness.values, c2.fitness.values
-        for mut in offspring:
-            if random.random() < req.mutation_rate:
-                toolbox.mutate(mut)
-                del mut.fitness.values
-        invalids = [ch for ch in offspring if not ch.fitness.valid]
-        for ch in invalids:
-            ch.fitness.values = toolbox.evaluate(ch)
-        offspring[0] = hall[0]
-        pop[:] = offspring
+        # Migration
+        if gen % interval == 0:
+            migrants_raw = rdb.lrange(MIGRATION_KEY, 0, num_islands - 1)
+            migrants     = [json.loads(m) for m in migrants_raw] if migrants_raw else []
+            if migrants:
+                async with httpx.AsyncClient() as client:
+                    tasks = [
+                        eval_with_retries(client, {
+                            "individual":      m,
+                            "execution_times": exec_times,
+                            "base_energy":     cfg["base_energy"],
+                            "idle_energy":     cfg["idle_energy"]
+                        })
+                        for m in migrants
+                    ]
+                    migrant_fits = await asyncio.gather(*tasks)
 
-    # Final metrics for best individual
-    best_individual = list(hall[0])
-    core_times, makespan, total_energy, imbalance = compute_metrics_for_individual(
-        best_individual, exec_times, req.num_cores, req.base_energy, req.idle_energy
-    )
+                # Replace worst with migrants
+                pairs = list(zip(population, fitnesses))
+                pairs.sort(key=lambda x: x[1], reverse=True)
+                for i, fit in enumerate(migrant_fits):
+                    if i < len(pairs):
+                        pairs[i] = (migrants[i], fit)
+                population = [ind for ind, _ in pairs]
+                rdb.delete(MIGRATION_KEY)
 
-    elapsed = time.time() - start_time
+        # Next generation
+        population = next_generation(population, fitnesses, cfg)
 
-    # Build final result JSON
+    # Ensure we have a best individual
+    if best_individual is None:
+        # fall back to the first individual if nothing improved (edge case)
+        best_individual = population[0]
+        cores, mk, te, imb = compute_raw_metrics(best_individual, exec_times, cfg["num_cores"],
+                                                 cfg["base_energy"], cfg["idle_energy"])
+        prev_best = best_per_gen[-1] if best_per_gen else float('inf')
+    else:
+        cores, mk, te, imb = compute_raw_metrics(best_individual, exec_times, cfg["num_cores"],
+                                                 cfg["base_energy"], cfg["idle_energy"])
+
+    elapsed_all = time.time() - start_all
+
+    # Build final JSON in the SAME SHAPE as monolithic GA
     final = {
-        # Identity
+        # identity / labeling
         "run_id":               job_id,
-        "case_label":           job_states[job_id].get("case_label"),
+        "case_label":           cfg.get("case_label"),
 
-        # Config snapshot
-        "num_tasks":            req.num_tasks,
-        "num_cores":            req.num_cores,
-        "num_population":       req.num_population,
-        "num_generations":      req.num_generations,
-        "crossover_rate":       req.crossover_rate,
-        "mutation_rate":        req.mutation_rate,
-        "base_energy":          req.base_energy,
-        "idle_energy":          req.idle_energy,
-        "stagnation_limit":     req.stagnation_limit,
-        "seed":                 req.seed,
+        # config snapshot (use monolithic key names for parity)
+        "num_tasks":            cfg["num_tasks"],
+        "num_cores":            cfg["num_cores"],
+        "num_population":       cfg["population"],
+        "num_generations":      cfg["generations"],
+        "crossover_rate":       cfg["crossover_rate"],
+        "mutation_rate":        cfg["mutation_rate"],
+        "base_energy":          cfg["base_energy"],
+        "idle_energy":          cfg["idle_energy"],
+        "stagnation_limit":     cfg.get("stagnation_limit"),
+        "seed":                 cfg.get("seed"),
 
-        # Outcomes
+        # outcomes
         "generations_executed": len(best_per_gen),
-        "elapsed_time_s":       elapsed,
+        "elapsed_time_s":       elapsed_all,
         "best_individual":      best_individual,
-        "best_fitness":         hall[0].fitness.values[0],
+        "best_fitness":         prev_best,
         "best_per_generation":  best_per_gen,
         "avg_per_generation":   avg_per_gen,
         "std_per_generation":   std_per_gen,
 
-        # Raw metrics for the final best solution
-        "makespan":             makespan,
-        "total_energy":         total_energy,
-        "imbalance":            imbalance,
-        "core_times":           core_times
+        # raw metrics of final best
+        "makespan":             mk,
+        "total_energy":         te,
+        "imbalance":            imb,
+        "core_times":           cores
     }
 
-    # Upload JSON
-    svc = BlobServiceClient.from_connection_string(conn_str)
+    # Upload JSON + plot to blob
     try:
-        svc.create_container(container)
-    except Exception:
-        pass
-    txt_blob = svc.get_blob_client(container=container, blob=f"{job_id}.txt")
-    txt_blob.upload_blob(json.dumps(final), overwrite=True)
+        txt_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.txt")
+        txt_blob.upload_blob(json.dumps(final), overwrite=True)
 
-    # Plot & upload PNG
-    plt.figure()
-    plt.plot(final["best_per_generation"], label="Best")
-    plt.plot(final["avg_per_generation"],  label="Average")
-    plt.xlabel("Generation")
-    plt.ylabel("Fitness")
-    plt.legend()
-    plt.tight_layout()
+        # Plot and upload PNG
+        plt.figure()
+        plt.plot(final["best_per_generation"], label="Best")
+        plt.plot(final["avg_per_generation"],  label="Average")
+        plt.xlabel("Generation")
+        plt.ylabel("Fitness")
+        plt.legend()
+        plt.tight_layout()
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=150)
+        plt.close()
+        buf.seek(0)
+        png_blob = svc.get_blob_client(container=AZ_CONTAINER, blob=f"{job_id}.png")
+        png_blob.upload_blob(buf.read(), overwrite=True)
+    except Exception as e:
+        logger.error(f"Blob upload failed for job {job_id}: {e}")
 
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150)
-    plt.close()  # free figure
-    buf.seek(0)
-    png_blob = svc.get_blob_client(container=container, blob=f"{job_id}.png")
-    png_blob.upload_blob(buf.read(), overwrite=True)
-
-    # Mark done and store result in memory
-    job_states[job_id]["status"] = "done"
-    job_results[job_id] = final
-    logger.info(f"[{job_id}] Completed. gens_exec={len(best_per_gen)} best_fitness={final['best_fitness']:.6f}")
+    # Mark done in Redis
+    rdb.hset(key, mapping={
+        "status": "stagnated" if stagnated else "done",
+        "generation": str(gen_executed),
+        "best": str(prev_best),
+        "individual": json.dumps(best_individual or [])
+    })
+    rdb.delete(MIGRATION_KEY)
+    logger.info(f"Job {job_id}: complete → status={'stagnated' if stagnated else 'done'}")
