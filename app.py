@@ -298,22 +298,6 @@ async def _run_ga(job_id: str, req: RunRequest):
     txt_blob = svc.get_blob_client(container=container, blob=f"{job_id}.txt")
     txt_blob.upload_blob(json.dumps(final), overwrite=True)
 
-    # Plot & upload PNG
-    plt.figure()
-    plt.plot(final["best_per_generation"], label="Best")
-    plt.plot(final["avg_per_generation"],  label="Average")
-    plt.xlabel("Generation")
-    plt.ylabel("Fitness")
-    plt.legend()
-    plt.tight_layout()
-
-    buf = io.BytesIO()
-    plt.savefig(buf, format="png", dpi=150)
-    plt.close()  # free figure
-    buf.seek(0)
-    png_blob = svc.get_blob_client(container=container, blob=f"{job_id}.png")
-    png_blob.upload_blob(buf.read(), overwrite=True)
-
     # Mark done and store result in memory
     job_states[job_id]["status"] = "done"
     job_results[job_id] = final
